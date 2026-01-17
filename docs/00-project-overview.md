@@ -3,6 +3,8 @@ This project aims to implement a configurable message broker in .NET, encapsulat
 
 The ultimate goal of this project is to really understand the implementation of message brokers, why their provided features help with a large-scale system, as well as proving my dexterity in using the C# language/.NET framework outside web applications.
 
+---
+
 # MVP Definition
 This project implemetation will start from a simple, in-memory message broker that supports the Publish/Subscribe pattern. Then the scope will be expanded to the stretch goals mentioned below.
 
@@ -21,6 +23,8 @@ This project implemetation will start from a simple, in-memory message broker th
 - Consumer groups
 - Consumer offsets
 - Back-pressure
+
+---
 
 # Configuration
 The broker will be configurable via a YAML file. The following configuration options will be supported:
@@ -43,6 +47,8 @@ bufferSizes:
   - 2048
 logLevel: info
 ```
+
+---
 
 # CLI
 As a core part of this project, I will implement a CLI tool that allows users to interact with the broker.
