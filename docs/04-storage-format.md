@@ -1,71 +1,3 @@
-# Storage Format
-
-**Purpose:** durability & recovery truth.
-
-## Disk Layout
-
-```aiignore
-data/
-  meta/
-    broker.id
-    checkpoint.json
-  topics/
-    <topic>/
-      <partition>/
-        segments/
-          00000000000000000000.log
-          00000000000000000000.idx
-          00000000000000000000.timeidx   (optional)
-          00000000000000000000.tomb      (optional)
-```
-**Naming rule:** segment base offset is a 20-digit zero-padded integer (lexicographic sort = numeric sort).
-
-## What each file is
-
-### `data/meta/broker.id`
-A small text/binary file that uniquely identifies this broker instance across restarts.
-
-**Used for:**
-- Cluster membership and replication identity (later)
-- Preventing accidental reuse of the same data directory by two different broker identities
-
-**Recommended contents (v1):**
-- `uuid` (e.g., a GUID)
-- `created_at` timestamp
-- optional: `node_name`
-
-**Write rules:**
-- Create once on first boot if missing
-- Never modify in place (only rewrite atomically if you ever change format)
-
----
-
-### `data/meta/checkpoint.json`
-A durability and fast-startup snapshot of what the broker believes is safely on disk.
-
-**Used for:**
-- Avoid scanning every segment at startup
-- Knowing the next offset to assign (`log_end_offset`)
-- Knowing which segment is active / last flushed offset
-
-**Minimum fields per partition (v1):**
-- `topic`
-- `partition`
-- `log_end_offset` (next offset to assign)
-- `active_segment_base_offset`
-- `active_segment_size_bytes`
-- optional: `last_flushed_offset` (if you separate buffered vs flushed)
-
-**Write rules (important):**
-- Write to `checkpoint.tmp` then `fsync`
-- Rename to `checkpoint.json`
-- `fsync` the directory
-
-**Crash behavior:**
-- If checkpoint is missing or stale, the broker must rebuild truth by scanning segment(s) and truncating to last valid frame.
-
----
-
 ### `data/topics/<topic>/<partition>/segments/<base>.log`
 The append-only segment log file containing the actual record bytes for this partition.
 
@@ -83,104 +15,45 @@ The append-only segment log file containing the actual record bytes for this par
 - One segment is “active” (currently appended)
 - When it reaches `segment_max_bytes` (or time-based roll), it becomes “closed” and a new active segment is created
 
----
+#### Log record frame format (v1)
 
-### `data/topics/<topic>/<partition>/segments/<base>.idx`
-A sparse offset→file-position index for the corresponding `.log` segment.
+Each `.log` segment is a concatenation of **frames**. One frame stores exactly one record.
 
-**Used for:**
-- Fast seek: binary search by offset, jump into the `.log`, then scan forward
+A frame layout is:
 
-**Key properties:**
-- Usually sparse (e.g., every 100 records)
-- Entries are monotonic by offset
-- Can be rebuilt by scanning the `.log` if missing/corrupt
+```
+[ HEADER (32 bytes) ][ KEY (key_len bytes) ][ VALUE (value_len bytes) ][ CRC32 (4 bytes) ][ FRAME_LEN (4 bytes) ]
+```
 
----
+All integer fields are **little-endian**.
 
-### `data/topics/<topic>/<partition>/segments/<base>.timeidx` (optional)
-A time→offset (or time→file-position) index for time-based fetch (e.g., “start from timestamp”).
+##### Header (32 bytes)
 
-**Used for:**
-- `FetchFromTimestamp(ts)` APIs
-- Faster time-based retention bookkeeping (optional)
+| Offset | Size | Field | Type | Meaning |
+|------:|-----:|------|------|---------|
+| 0 | 4 | `magic` | `u32` | Constant marker for frame start (v1: `0xB10B5E01`) |
+| 4 | 2 | `version` | `u16` | Frame format version (v1: `1`) |
+| 6 | 2 | `flags` | `u16` | Reserved bit flags (v1: `0`) |
+| 8 | 8 | `offset` | `i64` | Record offset within the partition (assigned by broker) |
+| 16 | 8 | `timestamp_ms` | `i64` | Record timestamp in milliseconds since epoch (v1 uses broker append time) |
+| 24 | 4 | `key_len` | `u32` | Length of key in bytes (0 allowed) |
+| 28 | 4 | `value_len` | `u32` | Length of value in bytes |
 
-**Key properties:**
-- Sparse mapping (e.g., every N records or every M milliseconds)
-- Rebuildable from `.log` by reading record timestamps
+##### Body (variable)
 
----
+- `key` bytes: `key_len` bytes (may be absent if `key_len = 0`)
+- `value` bytes: `value_len` bytes
 
-### `data/topics/<topic>/<partition>/segments/<base>.tomb` (optional)
-A tombstone marker file that indicates a segment is being deleted or was scheduled for deletion.
+##### Trailer (8 bytes)
 
-**Used for:**
-- Safer retention deletion across crashes
+| Order | Size | Field | Type | Meaning |
+|------:|-----:|------|------|---------|
+| 1 | 4 | `crc32` | `u32` | CRC32 over **header + body** (does **not** include the trailer) |
+| 2 | 4 | `frame_len` | `u32` | Total frame size in bytes: `32 + key_len + value_len + 8` |
 
-**Deletion flow (recommended):**
-1. Create `<base>.tomb`
-2. Delete `<base>.idx` / `<base>.timeidx` (if any)
-3. Delete `<base>.log`
-4. Delete `<base>.tomb`
+##### Recovery rules
 
-**Crash behavior:**
-- If the broker restarts and finds a `.tomb`, it can retry/finish deletion and avoid serving partially-deleted segments.
+- On startup, the broker scans the active segment frame-by-frame.
+- Scanning stops at the first invalid frame (partial tail, bad magic/version, size overflow, or CRC mismatch).
+- The segment is truncated back to the last valid frame boundary (“truncate-to-last-valid”).
 
-
-## File write rules
-
-### First boot (empty data/)
-
-When starting the broker the very first time:
-- Create data/ and subfolders as needed.
-- Create data/meta/broker.id (one-time identity).
-- Create an initial checkpoint.json (can be empty or “no topics yet”).
-
-Nothing else exists until we actually create a topic/partition or receive data.
-
-### Later boots (existing data/)
-
-Startup does recovery + resume:
-- Read broker.id (must exist).
-- Load checkpoint.json (if missing/stale, rebuild by scanning segments).
-- For each partition folder found:
-  - open segments
-  - recover active segment (scan/truncate partial tail if needed)
-  - rebuild .idx/.timeidx if needed
-  - Then the broker is ready to accept requests.
-
-### When the broker receives requests
-**On Publish (produce)**
-
-A publish turns into:
-1.	Ensure the topic/partition directories exist: `data/topics/<topic>/<partition>/segments/`
-2.	Ensure there is an active segment:
-   - if none exists → create `00000000000000000000.log` (+ `.idx`)
-   - if active segment too large → roll to a new `<base>.log`
-3.	Append a framed record to the active `.log`
-4.	Append an index entry to `.idx` (sparse or every record)
-5.	Update in-memory state (`log_end_offset`, `segment size`)
-6.	Periodically (or on flush policy) write `checkpoint.json` atomically
-
-**On Fetch (consume)**
-
-A subscribe request typically does not write to the log. It mostly:
-- finds the right segment by offset
-- uses .idx to jump into .log
-- streams records out
-
-The big question is whether your broker tracks consumer progress.
-
-**Option A (simpler v1): “stateless consumers”**
-- subscriber supplies fromOffset
-- broker returns records from that offset
-- broker does not store consumer offsets
-
-✅ no extra files needed
-
-**Option B: “tracked consumer offsets” (more Kafka-like)**
-- broker stores committed offsets per (group, topic, partition)
-- that adds another storage area, e.g.
-- `data/meta/consumer-offsets/...` or a special internal topic
-
-✅ more features, more files
