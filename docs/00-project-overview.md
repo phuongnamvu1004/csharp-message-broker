@@ -5,23 +5,28 @@ The ultimate goal of this project is to really understand the implementation of 
 
 ---
 
-# MVP Definition
-This project implemetation will start from a simple, in-memory message broker that supports the Publish/Subscribe pattern. Then the scope will be expanded to the stretch goals mentioned below.
+# V1 Scope (Standalone Consumers)
+This project’s first shippable version (v1) focuses on a **durable, log-based broker** with **standalone consumers** (Kafka “without a group”). Multiple consumers can connect concurrently, but the broker does not coordinate them.
 
-## Goals
+## V1 Goals
 - A broker process that accepts connections from clients.
-- Clients can publish to a topic and subscribe to a topic; broker routes messages to all subscribers of that topic.
+- Clients can publish to a topic partition; the broker appends records to an on-disk log.
+- Clients can fetch records from a topic partition starting at a specific offset (stateless fetch).
+- A CLI tool to publish and fetch messages (and basic metadata commands like listing partitions).
+- Basic durability and crash recovery (append-only segments + checkpoint + truncate-to-last-valid).
 
-## Non-Goals (to prevent scope creep)
-- No consumer groups, no offset commits, no replay.
-- No partitions (or “single partition per topic” if you want a stepping stone).
-- No ordering guarantees across topics.
-- Minimal durability (pick one: in-memory only or append-only log with “best effort”).
+## V1 Non-Goals (to prevent scope creep)
+- No consumer groups
+- No rebalancing
+- No broker-managed committed offsets
+- Each consumer decides which partitions to read and tracks its own offsets
 
-## Stretch Goals
-- Durable append-only log per partition
+---
+
+# V2 Goals (Next Milestone)
+These features are intentionally deferred until after v1 is stable:
 - Consumer groups
-- Consumer offsets
+- Consumer offsets (committed offsets)
 - Back-pressure
 
 ---

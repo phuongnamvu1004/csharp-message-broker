@@ -45,12 +45,13 @@ flowchart TB
 
 **Owns state**
 - Connection lifecycle, request parsing, response serialization.
-- Backpressure limits (max request size, max batch, timeouts).
+- Request-scoped limits (max request size, max batch, timeouts).
 
 ### 2) Topic/Partition Registry (Broker)
 **Responsibility**
 - Map `(topic, partition)` to an in-memory `PartitionLog` instance.
 - Create directories/initial segment lazily on first use (or via admin command later).
+- Expose topic metadata for standalone consumers (e.g., list partitions for a topic).
 
 **Owns state**
 - In-memory registry of partitions and their handles.
@@ -124,7 +125,7 @@ To keep correctness simple and match the storage format:
 
 ---
 
-## Request flows
+## Request flows (v1)
 
 ### Publish (produce)
 1. `Broker.Server` receives publish request.
@@ -136,37 +137,101 @@ To keep correctness simple and match the storage format:
    - update in-memory `log_end_offset`
 4. Periodically persist `checkpoint.json` (atomic replace) according to flush policy.
 
-### Fetch (consume)
-1. `Broker.Server` receives fetch request with `fromOffset` (v1 is stateless).
+### Fetch (consume, standalone)
+1. `Broker.Server` receives fetch request with `fromOffset`.
 2. Route to `(topic, partition)`.
 3. `PartitionLog.Fetch(fromOffset, ...)`:
    - find segment containing `fromOffset`
    - use `.idx` to seek into `.log`
    - scan forward and stream records up to limits
 
----
+### Metadata (standalone)
+- `ListTopics()` (optional)
+- `ListPartitions(topic)` (v1 equivalent of Kafka `partitionsFor()`)
 
-## Testing strategy aligned to projects
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Client (Broker.Cli / App)
+  participant S as Broker.Server
+  participant R as Topic/Partition Registry (Broker)
+  participant P as PartitionLog (Broker)
+  participant L as LogSegment (.log)
+  participant I as IndexFile (.idx)
+  participant CK as Checkpoint (checkpoint.json)
 
-- **Broker.Test (unit tests)**
-  - Log frame encode/decode roundtrips.
-  - Index search correctness.
-  - Segment recovery: simulate partial write then ensure truncate-to-last-valid works.
-  - PartitionLog append/fetch logic using temp directories.
+  rect rgb(240, 248, 255)
+  note over C,S: Publish (produce)
+  C->>S: Publish(topic, partition, key, value)
+  S->>R: GetOrCreatePartition(topic, partition)
+  R-->>S: PartitionLog handle
+  S->>P: Append(record)
+  P->>L: EnsureActiveSegment()
+  P->>L: AppendFrame(record)  %% writes to .log
+  P->>I: MaybeAppendIndex(offset, filePos) %% sparse
+  P-->>S: ack(offset)
+  S-->>C: PublishResult(offset)
+  end
 
-- **Broker.IntegrationTest (optional)**
-  - Start `Broker.Server` on a random port.
-  - Use `Broker.Cli` (or a thin test client) to:
-    - publish a batch and fetch it back
-    - restart server and verify recovery
-    - validate retention deletion behavior
+  rect rgb(245, 245, 245)
+  note over S,CK: Periodic (async-ish within server loop)
+  S->>CK: MaybeFlushCheckpoint()\n(atomic replace)
+  end
+
+  rect rgb(240, 255, 240)
+  note over C,S: Fetch (consume, standalone)
+  C->>S: Fetch(topic, partition, fromOffset, limits)
+  S->>R: GetPartition(topic, partition)
+  R-->>S: PartitionLog handle
+  S->>P: Fetch(fromOffset, limits)
+  P->>I: SeekNearest(fromOffset)\n(binary search .idx)
+  I-->>P: filePos
+  P->>L: ReadFrom(filePos)\nscan forward in .log
+  L-->>P: records batch + nextOffset
+  P-->>S: records batch + nextOffset
+  S-->>C: FetchResult(records, nextOffset)
+  end
+```
 
 ---
 
 ## What’s explicitly out of scope for v1
 
+To match the v1 scope in the project overview, the broker intentionally does **not** implement the following:
+
+- Consumer groups.
+- Rebalancing.
+- Broker-managed committed offsets (offset storage).
+- Exactly-once semantics.
 - Replication / clustering.
-- Consumer group offset tracking (v1 fetch is stateless: client supplies `fromOffset`).
 - Compaction / key-based indexing.
 
 These can be layered later without changing the fundamental append-only log segment model.
+
+---
+
+## V2 Architecture Goals (Next Milestone)
+
+V2 builds on the v1 storage engine and adds coordinated consumption.
+
+### Additions in v2
+
+1) **Consumer group coordinator (Broker.Server + Broker)**
+- Track group membership (join/leave/heartbeat).
+- Assign partitions to group members (rebalance).
+
+2) **Committed offset store (Broker)**
+- Persist committed offsets per `(group, topic, partition)`.
+- Storage options:
+  - Simple file-backed store under `data/meta/consumer-offsets/` (good for learning)
+  - Or an internal offsets topic (Kafka-like approach)
+
+3) **Rebalance-aware fetch semantics (Broker.Server)**
+- Enforce that a consumer may only fetch partitions currently assigned to it (for group mode).
+
+4) **Stronger backpressure / quotas (optional)**
+- Server-side controls for high fan-in/fan-out (limits, throttling, lag tracking).
+
+### Testing additions in v2
+- Integration tests for join/heartbeat/rebalance.
+- Restart recovery of committed offsets.
