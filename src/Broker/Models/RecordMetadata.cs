@@ -1,4 +1,4 @@
-namespace Broker.Storage;
+namespace Broker.Models;
 
 public sealed record RecordMetadata(
     long Offset,

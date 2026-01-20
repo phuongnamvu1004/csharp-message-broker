@@ -1,18 +1,11 @@
+using Broker.Models;
 using System.Buffers.Binary;
 using System.IO.Hashing;
 
-namespace Broker.Storage;
+namespace Broker.Framing;
 
 public sealed class LogFrameCodec
 {
-    private const uint Magic = 0xB10B5E01;
-    private const ushort Version = 1;
-    
-    private const int MaxPayloadBytes = 16 * 1024 * 1024; // 16MB v1 default
-    
-    private const int HeaderSizeBytes = 32;
-    private const int TrailerSizeBytes = 8; // u32 crc32 + u32 frameLen
-    
     private static RecordMetadata WriteFrame(FileStream fs, long nextOffset, LogRecord logRecord)
     {
         // Sanity checks
@@ -35,9 +28,9 @@ public sealed class LogFrameCodec
         var valueLen = (uint)value.Length;
 
         // Basic sanity guards (tune later via config)
-        if (keyLen + valueLen > MaxPayloadBytes)
+        if (keyLen + valueLen > LogFrameConstants.MaxPayloadBytes)
         {
-            throw new ArgumentOutOfRangeException(nameof(logRecord), $"Key+Value exceeds max payload {MaxPayloadBytes} bytes.");
+            throw new ArgumentOutOfRangeException(nameof(logRecord), $"Key+Value exceeds max payload {LogFrameConstants.MaxPayloadBytes} bytes.");
         }
 
         // If TimestampMs is 0, treat it as "broker sets append time" (v1 convenience)
@@ -46,12 +39,12 @@ public sealed class LogFrameCodec
             : DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         var bodyLen = checked((int)keyLen + (int)valueLen);
-        var frameLen = checked(HeaderSizeBytes + bodyLen + TrailerSizeBytes);
+        var frameLen = checked(LogFrameConstants.HeaderSizeBytes + bodyLen + LogFrameConstants.TrailerSizeBytes);
 
         // Build Header
-        Span<byte> header = stackalloc byte[HeaderSizeBytes];
-        BinaryPrimitives.WriteUInt32LittleEndian(header[..4], Magic);
-        BinaryPrimitives.WriteUInt16LittleEndian(header.Slice(4, 2), Version);
+        Span<byte> header = stackalloc byte[LogFrameConstants.HeaderSizeBytes];
+        BinaryPrimitives.WriteUInt32LittleEndian(header[..4], LogFrameConstants.Magic);
+        BinaryPrimitives.WriteUInt16LittleEndian(header.Slice(4, 2), LogFrameConstants.Version);
         BinaryPrimitives.WriteUInt16LittleEndian(header.Slice(6, 2), 0); // flags (v1: 0)
         BinaryPrimitives.WriteInt64LittleEndian(header.Slice(8, 8), nextOffset);
         BinaryPrimitives.WriteInt64LittleEndian(header.Slice(16, 8), ts);
@@ -85,7 +78,7 @@ public sealed class LogFrameCodec
             fs.Write(value, 0, value.Length);
         }
         // trailer
-        Span<byte> trailer = stackalloc byte[TrailerSizeBytes];
+        Span<byte> trailer = stackalloc byte[LogFrameConstants.TrailerSizeBytes];
         BinaryPrimitives.WriteUInt32LittleEndian(trailer[..4], crc);
         BinaryPrimitives.WriteUInt32LittleEndian(trailer.Slice(4, 4), (uint)frameLen);
         fs.Write(trailer);
@@ -137,8 +130,8 @@ public sealed class LogFrameCodec
         var bytesReturned = 0;
         var recordsReturned = 0;
 
-        var header = new byte[HeaderSizeBytes];
-        var trailer = new byte[TrailerSizeBytes];
+        var header = new byte[LogFrameConstants.HeaderSizeBytes];
+        var trailer = new byte[LogFrameConstants.TrailerSizeBytes];
 
         while (recordsReturned < maxRecords && bytesReturned < maxBytes)
         {
@@ -152,14 +145,14 @@ public sealed class LogFrameCodec
 
             // Parse and validate header
             var magic = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(0, 4));
-            if (magic != Magic)
+            if (magic != LogFrameConstants.Magic)
             {
                 // Not a valid frame boundary; treat as corruption/tail and stop.
                 yield break;
             }
 
             var version = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(4, 2));
-            if (version != Version)
+            if (version != LogFrameConstants.Version)
             {
                 // Unknown format for v1 reader
                 yield break;
@@ -172,7 +165,7 @@ public sealed class LogFrameCodec
             var valueLen = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(28, 4));
 
             // Size sanity
-            if (keyLen + valueLen > MaxPayloadBytes)
+            if (keyLen + valueLen > LogFrameConstants.MaxPayloadBytes)
             {
                 yield break;
             }
@@ -209,7 +202,7 @@ public sealed class LogFrameCodec
             var storedCrc = BinaryPrimitives.ReadUInt32LittleEndian(trailer.AsSpan(0, 4));
             var storedFrameLen = BinaryPrimitives.ReadUInt32LittleEndian(trailer.AsSpan(4, 4));
 
-            var expectedFrameLen = checked(HeaderSizeBytes + bodyLen + TrailerSizeBytes);
+            var expectedFrameLen = checked(LogFrameConstants.HeaderSizeBytes + bodyLen + LogFrameConstants.TrailerSizeBytes);
             if (storedFrameLen != (uint)expectedFrameLen)
             {
                 // Frame length mismatch => corruption
@@ -223,7 +216,6 @@ public sealed class LogFrameCodec
             {
                 crc32.Append(key!);
             }
-
             if (valueLen > 0)
             {
                 crc32.Append(value);
@@ -263,8 +255,7 @@ public sealed class LogFrameCodec
     }
     public static RecordMetadata LogFrameWriter(FileStream fs, long nextOffset, LogRecord logRecord)
         => WriteFrame(fs, nextOffset, logRecord);
-
-    // Reader will be implemented next; leaving as stub for now.
+    
     public static IEnumerable<LogRecord> LogFrameReader(FileStream fs, long fromOffset, int maxBytes, int maxRecords)
         => ReadFrame(fs, fromOffset, maxBytes, maxRecords);
 }
