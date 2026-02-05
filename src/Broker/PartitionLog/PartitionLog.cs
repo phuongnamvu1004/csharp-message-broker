@@ -1,3 +1,6 @@
+using System.Buffers.Binary;
+using System.Collections.Generic;
+using Broker.Framing;
 using Broker.Models;
 
 namespace Broker.PartitionLog;
@@ -5,10 +8,11 @@ namespace Broker.PartitionLog;
 public class PartitionLog : IPartitionLog
 {
     private readonly LogOptions _options;
-    private readonly object _gate = new();
+    private readonly object _gate = new(); // making this thread-safe by ensuring only one thread can touch _activeStream / _nextOffset at a time.
     private FileStream _activeStream;
     private long _nextOffset;
-    private bool _disposed;
+    private bool _disposed; // a boolean flag to track whether this PartitionLog has been disposed of.
+    private int _appendSinceLastFlush;
     
     public PartitionLog(LogOptions options)
     {
@@ -31,11 +35,25 @@ public class PartitionLog : IPartitionLog
 
         lock (_gate)
         {
-            // TODO (Step 1): offset = _nextOffset
-            // TODO (Step 2): write frame via LogFrameCodec.WriteFrame(_activeStream, offset, record)
-            // TODO (Step 3): advance _nextOffset
-            // TODO (Step 4): optionally flush depending on options
-            throw new NotImplementedException();
+            var offset = _nextOffset;
+
+            if (_activeStream.Position != _activeStream.Length)
+                _activeStream.Seek(0, SeekOrigin.End);
+
+            var meta = LogFrameCodec.LogFrameWriter(_activeStream, offset, record);
+
+            if (_options.FlushEveryNAppends > 0)
+            {
+                _appendSinceLastFlush++;
+                if (_appendSinceLastFlush >= _options.FlushEveryNAppends)
+                {
+                    _activeStream.Flush(flushToDisk: true);
+                    _appendSinceLastFlush = 0;
+                }
+            }
+
+            _nextOffset = offset + 1;
+            return meta;
         }
     }
 
@@ -76,6 +94,8 @@ public class PartitionLog : IPartitionLog
         // TODO (MVP): scan frames to the end and compute lastOffset+1.
         // For now, return 0 so you can implement recovery as the next step.
         // IMPORTANT: leave stream positioned at end for appends.
+        
+        // offset is at position 8 with size 8 bytes in the header
         return 0;
     }
     

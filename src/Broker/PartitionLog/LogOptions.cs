@@ -8,5 +8,7 @@ public sealed class LogOptions
     public bool EnableIndex { get; init; } = true;
 
     // Durability policy (MVP can ignore or implement lightly)
-    public int FlushEveryNAppends { get; init; } = 0; // 0 = never force flush
+    public int FlushEveryNAppends { get; init; } = 0; // FlushEveryNAppends == 0 → never force flush
+                                                      // FlushEveryNAppends == 1 → flush every append
+                                                      // FlushEveryNAppends == N → flush every N appends
 }
